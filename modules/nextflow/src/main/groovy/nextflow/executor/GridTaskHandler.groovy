@@ -35,6 +35,7 @@ import groovy.util.logging.Slf4j
 import nextflow.exception.ProcessException
 import nextflow.exception.ProcessFailedException
 import nextflow.exception.ProcessNonZeroExitStatusException
+import nextflow.executor.CondorExecutor
 import nextflow.file.FileHelper
 import nextflow.fusion.FusionAwareTask
 import nextflow.fusion.FusionHelper
@@ -118,10 +119,11 @@ class GridTaskHandler extends TaskHandler implements FusionAwareTask {
         ProcessBuilder builder = new ProcessBuilder()
             .command( cli as String[] )
             .redirectErrorStream(true)
-        if( !fusionEnabled() )
+        if( !fusionEnabled() && !(executor instanceof CondorExecutor) )
             builder .directory(task.workDir.toFile())
 
         return builder
+    
     }
 
     @Memoized

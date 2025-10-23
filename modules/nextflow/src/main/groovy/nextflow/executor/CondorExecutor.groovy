@@ -16,9 +16,10 @@
 
 package nextflow.executor
 import java.nio.file.Path
+import java.nio.file.Paths
 
 import groovy.transform.CompileStatic
-import groovy.transform.InheritConstructors
+import groovy.util.logging.Slf4j
 import nextflow.processor.TaskRun
 /**
  * HTCondor executor
@@ -27,14 +28,21 @@ import nextflow.processor.TaskRun
  *
  * @author Paolo Di Tommaso <paolo.ditommaso@gmail.com>
  */
+@Slf4j
 @CompileStatic
 class CondorExecutor extends AbstractGridExecutor {
 
     static final public String CMD_CONDOR = '.command.condor'
 
+    protected Path resolveSubmitFilePath(TaskRun task) {
+        final submitBaseDir = Paths.get('.nextflow', 'condor-submit')
+        final sessionDir = submitBaseDir.resolve(session.uniqueId.toString())
+        final taskHash = task.workDir.name
+        return sessionDir.resolve("${taskHash}.condor")
+    }
+
     final protected BashWrapperBuilder createBashWrapperBuilder(TaskRun task) {
-        // creates the wrapper script
-        final builder = new CondorWrapperBuilder(task)
+        final builder = new CondorWrapperBuilder(task, this)
         builder.manifest = getDirectivesText(task)
         return builder
     }
@@ -54,7 +62,7 @@ class CondorExecutor extends AbstractGridExecutor {
     protected List<String> getDirectives(TaskRun task, List<String> result) {
 
         result << "universe = vanilla"
-        result << "executable = ${TaskRun.CMD_RUN}".toString()
+        result << "executable = ${task.workDir.resolve(TaskRun.CMD_RUN)}".toString()
         result << "log = ${TaskRun.CMD_LOG}".toString()
         result << "getenv = true"
 
@@ -91,7 +99,8 @@ class CondorExecutor extends AbstractGridExecutor {
 
     @Override
     List<String> getSubmitCommandLine(TaskRun task, Path scriptFile) {
-        return ['condor_submit', '--terse', CMD_CONDOR]
+        final condorFile = resolveSubmitFilePath(task)
+        return ['condor_submit', '--terse', condorFile.toString()]
     }
 
     @Override
@@ -148,18 +157,51 @@ class CondorExecutor extends AbstractGridExecutor {
         return result
     }
 
+    @Override
+    void shutdown() {
+        super.shutdown()
+        if( session.config.cleanup )
+            cleanupSubmitFiles()
+    }
 
-    @InheritConstructors
+    protected void cleanupSubmitFiles() {
+        final submitBaseDir = Paths.get('.nextflow', 'condor-submit')
+        final sessionDir = submitBaseDir.resolve(session.uniqueId.toString())
+        
+        if( sessionDir.exists() ) {
+            log.debug "[CONDOR] Cleaning up submit files in: $sessionDir"
+            try {
+                sessionDir.deleteDir()
+            } catch( Exception e ) {
+                log.warn "[CONDOR] Failed to cleanup submit files: ${e.message}"
+            }
+        }
+    }
+
+
     static class CondorWrapperBuilder extends BashWrapperBuilder {
 
         String manifest
+        CondorExecutor executor
+        TaskRun task
+
+        CondorWrapperBuilder(TaskRun task, CondorExecutor executor) {
+            super(task)
+            this.executor = executor
+            this.task = task
+        }
 
         Path build() {
             final wrapper = super.build()
-            // give execute permission to wrapper file
             wrapper.setExecutable(true)
-            // save the condor manifest
-            this.workDir.resolve(CMD_CONDOR).text = manifest
+            
+            final Path condorFile = executor.resolveSubmitFilePath(task)
+            
+            if( condorFile.parent != this.workDir ) {
+                condorFile.parent.toFile().mkdirs()
+            }
+            
+            condorFile.text = manifest
             return wrapper
         }
 
