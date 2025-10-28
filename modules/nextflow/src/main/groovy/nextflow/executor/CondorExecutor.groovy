@@ -22,6 +22,8 @@ import java.nio.file.StandardCopyOption
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import nextflow.container.ContainerBuilder
+import nextflow.file.FileHelper
 import nextflow.processor.TaskBean
 import nextflow.processor.TaskRun
 import nextflow.util.Escape
@@ -39,6 +41,7 @@ class CondorExecutor extends AbstractGridExecutor {
     static final public String CMD_CONDOR = '.command.condor'
 
     private Path stagedBinDir
+    private Map<String, Path> autoStagedDirectories = [:]
 
     protected Path resolveSubmitFilePath(TaskRun task) {
         final submitDir = config?.getExecConfigProp(name, 'submitFileDir', null) as String
@@ -74,8 +77,9 @@ class CondorExecutor extends AbstractGridExecutor {
         final bean = new TaskBean(task)
         
         // Create appropriate file copy strategy
-        final copyStrategy = pathMappings
-            ? new CondorFileCopyStrategy(bean, pathMappings)
+        // Use CondorFileCopyStrategy when not using shared filesystem (for path normalization)
+        final copyStrategy = !isSharedFilesystem()
+            ? new CondorFileCopyStrategy(bean, pathMappings, this)
             : new SimpleFileCopyStrategy(bean)
         
         // Create wrapper builder with custom strategy
@@ -291,6 +295,8 @@ class CondorExecutor extends AbstractGridExecutor {
             log.debug "[CONDOR] Input staging: ${pathMappings ? 'symlink (with path normalization)' : 'symlink'}"
             log.debug "[CONDOR] Output unstaging: enabled"
             log.debug "[CONDOR] HTCondor event logs disabled in restricted filesystem mode"
+            
+            processAutoStageDirectories()
         } else {
             log.debug "[CONDOR] Running in shared filesystem mode"
         }
@@ -349,17 +355,215 @@ class CondorExecutor extends AbstractGridExecutor {
         }
     }
 
+    /**
+     * Check if a path is accessible from compute nodes.
+     */
+    protected boolean isAccessibleFromComputeNodes(Path path) {
+        final pathStr = path.toAbsolutePath().toString()
+        
+        final accessiblePrefixes = ['/staging', '/cvmfs', '/mnt/gluster']
+        
+        return accessiblePrefixes.any { pathStr.startsWith(it) }
+    }
+
+    /**
+     * Process autoStageDirectories configuration and stage directories to accessible locations.
+     * Called during executor registration when sharedFilesystem = false.
+     */
+    protected void processAutoStageDirectories() {
+        // Get configuration with default
+        def autoStageList = config?.getExecConfigProp(name, 'autoStageDirectories', null) as List
+        
+        // Default: stage projectDir if not accessible (backward compatibility)
+        if (autoStageList == null) {
+            if (session.baseDir && !isAccessibleFromComputeNodes(session.baseDir)) {
+                autoStageList = [session.baseDir.toString()]
+            } else {
+                autoStageList = []
+            }
+        }
+        
+        if (!autoStageList) {
+            log.debug "[CONDOR] No directories configured for auto-staging"
+            return
+        }
+        
+        log.debug "[CONDOR] Processing autoStageDirectories: ${autoStageList}"
+        
+        autoStageList.each { dirSpec ->
+            def dirPath = resolveDirectoryPath(dirSpec)
+            
+            if (!dirPath) {
+                log.warn "[CONDOR] Could not resolve directory: ${dirSpec}"
+                return
+            }
+            
+            if (isAccessibleFromComputeNodes(dirPath)) {
+                log.debug "[CONDOR] Directory already accessible, skipping: ${dirPath}"
+                return
+            }
+            
+            // Stage the directory
+            def stagedPath = stageDirectory(dirPath)
+            if (stagedPath) {
+                autoStagedDirectories[dirPath.toString()] = stagedPath
+                log.debug "[CONDOR] Staged directory: ${dirPath} -> ${stagedPath}"
+            }
+        }
+        
+        if (autoStagedDirectories) {
+            log.debug "[CONDOR] Auto-staged directories summary:"
+            autoStagedDirectories.each { original, staged ->
+                log.debug "[CONDOR]   ${original} -> ${staged}"
+            }
+        }
+    }
+
+    /**
+     * Resolve a directory path specification, handling variables like ${projectDir}.
+     */
+    protected Path resolveDirectoryPath(Object dirSpec) {
+        def dirStr = dirSpec.toString()
+        
+        // Handle ${projectDir} variable
+        if (dirStr.contains('${projectDir}')) {
+            if (!session.baseDir) {
+                log.warn "[CONDOR] Cannot resolve \${projectDir} - session.baseDir is null"
+                return null
+            }
+            dirStr = dirStr.replace('${projectDir}', session.baseDir.toString())
+        }
+        
+        def path = Paths.get(dirStr)
+        
+        if (!path.exists()) {
+            log.warn "[CONDOR] Directory does not exist: ${path}"
+            return null
+        }
+        
+        return path
+    }
+
+    /**
+     * Stage a directory to an accessible location.
+     * 
+     * @param sourceDir The directory to stage
+     * @return The staged directory path, or null if staging failed
+     */
+    protected Path stageDirectory(Path sourceDir) {
+        // Generate unique staging directory name
+        def dirName = sourceDir.fileName.toString()
+        def stagingDirName = ".staged-${dirName}"
+        def targetDir = workDir.resolve(stagingDirName)
+        
+        try {
+            log.debug "[CONDOR] Staging directory ${sourceDir} to ${targetDir}"
+            
+            Files.createDirectories(targetDir)
+            copyDirectoryTree(sourceDir, targetDir)
+            
+            log.debug "[CONDOR] Successfully staged directory to ${targetDir}"
+            return targetDir
+            
+        } catch (Exception e) {
+            log.error "[CONDOR] Failed to stage directory ${sourceDir}: ${e.message}"
+            throw new IllegalStateException(
+                "Failed to stage directory for HTCondor execution. " +
+                "Directory (${sourceDir}) is not accessible from compute nodes. " +
+                "Either move it to /staging or ensure it's in an accessible location.",
+                e
+            )
+        }
+    }
+
+    /**
+     * Copy directory tree, excluding unwanted files and directories.
+     */
+    protected void copyDirectoryTree(Path source, Path target) {
+        final excludedDirs = ['work', 'results', 'logs', '.git', '.nextflow'] as Set
+        
+        source.eachFileRecurse { srcFile ->
+            final relativePath = source.relativize(srcFile)
+            
+            // Skip if any component in the path starts with '.' (hidden)
+            if( relativePath.any { it.toString().startsWith('.') } ) {
+                return
+            }
+            
+            // Skip if path starts with any excluded directory
+            final firstComponent = relativePath.getName(0).toString()
+            if( excludedDirs.contains(firstComponent) ) {
+                return
+            }
+            
+            final targetFile = target.resolve(relativePath)
+            
+            if( srcFile.isDirectory() ) {
+                Files.createDirectories(targetFile)
+            } else {
+                Files.createDirectories(targetFile.parent)
+                Files.copy(srcFile, targetFile, StandardCopyOption.REPLACE_EXISTING)
+            }
+        }
+    }
+
+    /**
+     * Normalize a path by applying auto-staged directory mappings and user-configured path mappings.
+     * This method is used by both the file copy strategy (for staging symlinks) and the container
+     * builder (for bind mounts) to ensure consistent path rewriting.
+     * 
+     * @param path The path to normalize
+     * @param pathMappings Optional user-configured path mappings (external system topology)
+     * @return The normalized path with staging and mappings applied
+     */
+    protected String normalizePathWithStaging(String path, Map<String,String> pathMappings = null) {
+        // FIRST: Check auto-staged directories (Nextflow-internal staging)
+        // Sort by key length (longest first) to handle nested paths correctly
+        if( autoStagedDirectories ) {
+            def sortedStaged = autoStagedDirectories.entrySet()
+                .sort { a, b -> b.key.length() <=> a.key.length() }
+            
+            for (entry in sortedStaged) {
+                if (path.startsWith(entry.key)) {
+                    def normalized = entry.value.toString() + path.substring(entry.key.length())
+                    log.trace "[CONDOR] Auto-staged path rewrite: $path -> $normalized"
+                    return normalized
+                }
+            }
+        }
+        
+        // SECOND: Apply user-configured path mappings (external system topology)
+        if (!pathMappings) {
+            return path
+        }
+        
+        def sortedMappings = pathMappings.entrySet()
+            .sort { a, b -> b.key.length() <=> a.key.length() }
+        
+        for (entry in sortedMappings) {
+            if (path.startsWith(entry.key)) {
+                def normalized = entry.value + path.substring(entry.key.length())
+                log.trace "[CONDOR] Path mapping applied: $path -> $normalized"
+                return normalized
+            }
+        }
+        
+        return path
+    }
+
 
     static class CondorWrapperBuilder extends BashWrapperBuilder {
 
         String manifest
         CondorExecutor executor
         TaskRun task
+        private Map<String,String> pathMappings
 
         CondorWrapperBuilder(TaskBean bean, TaskRun task, CondorExecutor executor, ScriptFileCopyStrategy copyStrategy = null) {
             super(bean, copyStrategy)
             this.executor = executor
             this.task = task
+            this.pathMappings = executor.config?.getExecConfigProp(executor.name, 'pathMappings', null) as Map<String,String>
         }
 
         @Override
@@ -381,8 +585,99 @@ class CondorExecutor extends AbstractGridExecutor {
                 return explicit as boolean
             }
             
-            // Auto mode: unstage outputs when not using shared filesystem
+            // When not using shared filesystem, HTCondor transfers outputs to submit directory
+            // Nextflow needs to unstage them to the work directory
             return !executor.isSharedFilesystem()
+        }
+
+        @Override
+        protected ContainerBuilder createContainerBuilder(String changeDir) {
+            // Only override if we need custom path handling
+            if( !executor.isSharedFilesystem() ) {
+                return createCondorContainerBuilder(changeDir)
+            }
+            
+            return super.createContainerBuilder(changeDir)
+        }
+
+        protected ContainerBuilder createCondorContainerBuilder(String changeDir) {
+            final builder = createContainerBuilder0()
+            
+            // Normalize input files for container bind mounts using shared normalization
+            if( stageInMode != 'copy' && allowContainerMounts ) {
+                final normalizedInputFiles = new LinkedHashMap<String,Path>()
+                inputFiles.each { stageName, storePath ->
+                    def normalized = executor.normalizePathWithStaging(((Path)storePath).toAbsolutePath().toString(), pathMappings)
+                    normalizedInputFiles[(String)stageName] = Paths.get(normalized)
+                }
+                builder.addMountForInputs(normalizedInputFiles)
+            }
+            
+            if( allowContainerMounts )
+                builder.addMounts(binDirs)
+            
+            if( this.containerMount )
+                builder.addMount(containerMount)
+            
+            // Add bind mounts for all auto-staged directories
+            if( executor.autoStagedDirectories ) {
+                executor.autoStagedDirectories.each { originalPath, stagedPath ->
+                    log.trace "[CONDOR] Adding auto-staged bind mount: ${stagedPath} -> ${originalPath}"
+                    builder.addRunOptions("-B ${stagedPath}:${originalPath}")
+                }
+            }
+            
+            if( allowContainerMounts )
+                builder.setWorkDir(workDir)
+            
+            builder.setName('$NXF_BOXID')
+            
+            if( this.containerMemory )
+                builder.setMemory(containerMemory)
+            
+            if( this.containerCpus )
+                builder.setCpus(containerCpus)
+            
+            if( this.containerCpuset )
+                builder.addRunOptions(containerCpuset)
+            
+            if( this.containerPlatform )
+                builder.setPlatform(this.containerPlatform)
+            
+            builder.addEnv('NXF_TASK_WORKDIR')
+            
+            if( isTraceRequired() )
+                builder.addEnv( 'NXF_DEBUG=${NXF_DEBUG:=0}')
+            
+            if( fixOwnership() )
+                builder.addEnv( 'NXF_OWNER=$(id -u):$(id -g)' )
+            
+            for( String var : containerConfig.getEnvWhitelist() ) {
+                builder.addEnv(var)
+            }
+            
+            if( !isSecretNative() && secretNames )  {
+                for( String var : secretNames )
+                    builder.addEnv(var)
+            }
+            
+            if( containerConfig.getTemp() == 'auto' )
+                builder.setTemp( changeDir ? '$NXF_SCRATCH' : '$(nxf_mktemp)' )
+            
+            if( containerConfig.getKill() != null )
+                builder.params(kill: containerConfig.getKill())
+            
+            if( containerConfig.entrypointOverride() )
+                builder.params(entry: '/bin/bash')
+            
+            if( containerOptions ) {
+                builder.addRunOptions(containerOptions)
+            }
+            
+            builder.addMountWorkDir( changeDir as boolean || FileHelper.getWorkDirIsSymlink() )
+            
+            builder.build()
+            return builder
         }
 
         Path build() {
@@ -408,10 +703,12 @@ class CondorExecutor extends AbstractGridExecutor {
     static class CondorFileCopyStrategy extends SimpleFileCopyStrategy {
         
         private Map<String,String> pathMappings
+        private CondorExecutor executor
         
-        CondorFileCopyStrategy(TaskBean bean, Map<String,String> pathMappings) {
+        CondorFileCopyStrategy(TaskBean bean, Map<String,String> pathMappings, CondorExecutor executor) {
             super(bean)
             this.pathMappings = pathMappings ?: [:]
+            this.executor = executor
         }
         
         @Override
@@ -425,39 +722,13 @@ class CondorExecutor extends AbstractGridExecutor {
             // Get absolute path (this handles relative paths if any)
             def pathStr = path.toAbsolutePath().toString()
             
-            // Apply path mappings to normalize canonical paths
-            pathStr = normalizePath(pathStr)
+            // Use shared normalization from executor
+            pathStr = executor.normalizePathWithStaging(pathStr, pathMappings)
             
             // Generate staging command with normalized path
             cmd += stageInCommand(pathStr, targetName, stageinMode)
             return cmd
         }
-        
-        /**
-         * Normalize a path by applying configured path mappings.
-         * Uses longest-match-first algorithm to handle nested mappings.
-         * 
-         * @param path The canonical path to normalize
-         * @return The normalized path with mappings applied
-         */
-        protected String normalizePath(String path) {
-            if( !pathMappings ) {
-                return path
-            }
-            
-            // Sort mappings by key length (longest first) to handle nested paths
-            def sortedMappings = pathMappings.entrySet()
-                .sort { a, b -> b.key.length() <=> a.key.length() }
-            
-            for( entry in sortedMappings ) {
-                if( path.startsWith(entry.key) ) {
-                    def normalized = entry.value + path.substring(entry.key.length())
-                    log.trace "[CONDOR] Normalized path: $path -> $normalized"
-                    return normalized
-                }
-            }
-            
-            return path
-        }
+
     }
 }
