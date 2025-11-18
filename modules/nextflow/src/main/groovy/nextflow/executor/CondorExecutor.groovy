@@ -26,6 +26,8 @@ import nextflow.container.ContainerBuilder
 import nextflow.file.FileHelper
 import nextflow.processor.TaskBean
 import nextflow.processor.TaskRun
+import nextflow.secret.LocalSecretsProvider
+import nextflow.secret.SecretsLoader
 import nextflow.util.Escape
 /**
  * HTCondor executor
@@ -376,10 +378,28 @@ class CondorExecutor extends AbstractGridExecutor {
         
         // Default: stage projectDir if not accessible (backward compatibility)
         if (autoStageList == null) {
+            autoStageList = []
+            
             if (session.baseDir && !isAccessibleFromComputeNodes(session.baseDir)) {
-                autoStageList = [session.baseDir.toString()]
-            } else {
-                autoStageList = []
+                autoStageList << session.baseDir.toString()
+            }
+            
+            // Add secrets directory if not accessible and enabled
+            if( SecretsLoader.isEnabled() ) {
+                try {
+                    def provider = SecretsLoader.instance.load()
+                    if( provider instanceof LocalSecretsProvider ) {
+                        // Access the secrets directory path
+                        def secretsDir = provider.@storeFile.parent
+                        
+                        if( secretsDir && !isAccessibleFromComputeNodes(secretsDir) ) {
+                            log.debug "[CONDOR] Secrets directory not accessible from compute nodes: ${secretsDir}"
+                            autoStageList << secretsDir.toString()
+                        }
+                    }
+                } catch( Exception e ) {
+                    log.debug "[CONDOR] Could not determine secrets directory for staging: ${e.message}"
+                }
             }
         }
         
@@ -460,7 +480,26 @@ class CondorExecutor extends AbstractGridExecutor {
             log.debug "[CONDOR] Staging directory ${sourceDir} to ${targetDir}"
             
             Files.createDirectories(targetDir)
-            copyDirectoryTree(sourceDir, targetDir)
+            
+            // Special handling for secrets directory (contains hidden files)
+            if( dirName == 'secrets' && sourceDir.parent?.fileName?.toString() == '.nextflow' ) {
+                log.debug "[CONDOR] Staging secrets files (hidden files) from ${sourceDir}"
+                int copiedFiles = 0
+                
+                sourceDir.eachFile { file ->
+                    if( file.name.startsWith('.nf-') && file.name.endsWith('.secrets') ) {
+                        final target = targetDir.resolve(file.name)
+                        Files.copy(file, target, StandardCopyOption.REPLACE_EXISTING)
+                        target.setPermissions('rw-------')
+                        copiedFiles++
+                    }
+                }
+                
+                log.debug "[CONDOR] Staged ${copiedFiles} secrets file(s) to ${targetDir}"
+            } else {
+                // Normal directory staging (excludes hidden files)
+                copyDirectoryTree(sourceDir, targetDir)
+            }
             
             log.debug "[CONDOR] Successfully staged directory to ${targetDir}"
             return targetDir
@@ -588,6 +627,34 @@ class CondorExecutor extends AbstractGridExecutor {
             // When not using shared filesystem, HTCondor transfers outputs to submit directory
             // Nextflow needs to unstage them to the work directory
             return !executor.isSharedFilesystem()
+        }
+
+        @Override
+        protected String getSecretsEnv() {
+            // Get the original bash command from parent
+            def command = super.getSecretsEnv()
+            
+            // If shared filesystem or no command, return as-is
+            if( executor.isSharedFilesystem() || !command ) {
+                return command
+            }
+            
+            // Apply path normalization using autoStagedDirectories
+            // The command contains file path(s) that need rewriting
+            def normalizedCommand = command
+            
+            executor.autoStagedDirectories.each { originalPath, stagedPath ->
+                // Replace any occurrence of the original path with staged path
+                normalizedCommand = normalizedCommand.replace(originalPath.toString(), stagedPath.toString())
+            }
+            
+            if( normalizedCommand != command ) {
+                log.trace "[CONDOR] Rewritten secrets command for task ${task.name}"
+                log.trace "[CONDOR]   Original: ${command}"
+                log.trace "[CONDOR]   Rewritten: ${normalizedCommand}"
+            }
+            
+            return normalizedCommand
         }
 
         @Override
